@@ -57,31 +57,17 @@ python -m swebench.harness.run_evaluation \
 # Step 3: Collect diagnostics
 echo ""
 echo "=== Step 3: Collecting diagnostics ==="
-# For now, we use a simplified diagnostics collection
-# Full Docker-based diagnostics would be run here
+# Run real Docker diagnostics inside SWE-bench containers
 python -c "
-import json
 from pathlib import Path
+from swe_cgd.diagnostics.docker_runner import run_diagnostics_batch
 
 preds_file = Path('$BASELINE_PREDS')
 diag_file = Path('output/${RUN_ID}_diagnostics.jsonl')
-diag_file.parent.mkdir(exist_ok=True)
 
-with open(preds_file) as f:
-    predictions = [json.loads(l) for l in f if l.strip()]
-
-with open(diag_file, 'w') as f:
-    for pred in predictions:
-        diag = {
-            'instance_id': pred['instance_id'],
-            'patch_applied': bool(pred['model_patch'].strip()),
-            'syntax_errors': [],
-            'type_errors': [],
-            'summary': 'Pending full diagnostics'
-        }
-        f.write(json.dumps(diag) + '\n')
-
-print(f'Created diagnostics stub: {diag_file}')
+print(f'Running Docker diagnostics on {preds_file}...')
+run_diagnostics_batch(preds_file, diag_file, timeout=120)
+print(f'Diagnostics saved to: {diag_file}')
 "
 
 DIAGNOSTICS_FILE="output/${RUN_ID}_diagnostics.jsonl"

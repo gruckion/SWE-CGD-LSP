@@ -136,12 +136,40 @@ class DockerDiagnosticsRunner:
                 )
 
                 output = proc.stdout + proc.stderr
-                result = self._parse_output(instance_id, output)
+
+                # Check for Docker-level failures (image not found, permission errors, etc.)
+                # Note: returncode != 0 from the script itself is expected for patch failures
+                # so we check for specific Docker error patterns
+                if proc.returncode != 0:
+                    # Check if this is a known script-level failure (patch failed)
+                    if "PATCH_CHECK_FAILED" in output or "PATCH_APPLY_FAILED" in output:
+                        result = self._parse_output(instance_id, output)
+                    # Check for Docker-specific errors
+                    elif "Unable to find image" in output or "Error response from daemon" in output:
+                        result.patch_applied = False
+                        result.apply_error = f"Docker error: {output[:500]}"
+                    elif "permission denied" in output.lower():
+                        result.patch_applied = False
+                        result.apply_error = f"Docker permission error: {output[:500]}"
+                    elif not output.strip():
+                        # Empty output with non-zero exit = likely Docker failure
+                        result.patch_applied = False
+                        result.apply_error = f"Docker failed with exit code {proc.returncode}"
+                    else:
+                        # Non-zero exit but has output - try to parse it
+                        result = self._parse_output(instance_id, output)
+                        # If parsing didn't find any issues but we had non-zero exit,
+                        # that's suspicious - mark as potential failure
+                        if not result.has_issues and "=== DIAGNOSTICS COMPLETE ===" not in output:
+                            result.patch_applied = False
+                            result.apply_error = f"Diagnostics incomplete (exit {proc.returncode})"
+                else:
+                    result = self._parse_output(instance_id, output)
 
         except subprocess.TimeoutExpired:
             result.apply_error = "Diagnostics timed out"
-        except subprocess.CalledProcessError as e:
-            result.apply_error = f"Docker error: {e}"
+        except FileNotFoundError:
+            result.apply_error = "Docker not found - is Docker installed?"
         except Exception as e:
             result.apply_error = f"Unexpected error: {e}"
 

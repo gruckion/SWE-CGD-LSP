@@ -174,8 +174,8 @@ def run_pipeline(
     max_instances: Optional[int] = typer.Option(None, "--max", "-n"),
     instance_ids: Optional[str] = typer.Option(None, "--instances", "-i"),
     max_workers: int = typer.Option(4, "--workers", "-w"),
-    skip_baseline: bool = typer.Option(False, "--skip-baseline"),
     skip_eval: bool = typer.Option(False, "--skip-eval", help="Skip SWE-bench evaluation"),
+    include_control: bool = typer.Option(True, "--control/--no-control", help="Include control experiment"),
     run_id: str = typer.Option("cgd_experiment", "--run-id"),
 ):
     """Run the full validation pipeline.
@@ -183,12 +183,13 @@ def run_pipeline(
     Steps:
     1. Generate baseline predictions
     2. Run SWE-bench evaluation on baseline
-    3. Collect diagnostics on failed instances
-    4. Generate cleanup predictions
+    3. Collect diagnostics (pyright, py_compile) in Docker containers
+    4. Generate cleanup predictions using diagnostic feedback
     5. Run SWE-bench evaluation on cleanup
-    6. Compare results
+    6. (Optional) Run control experiment (resample without diagnostics)
+    7. Compare results and generate forensics report
     """
-    from datetime import datetime
+    from .pipeline.orchestrator import PipelineOrchestrator
 
     config = load_config()
     config.llm.model = model
@@ -199,44 +200,51 @@ def run_pipeline(
     if instance_ids:
         config.instance_ids = [i.strip() for i in instance_ids.split(",")]
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = f"{run_id}_{timestamp}"
-
     console.print(f"[bold blue]Starting CGD validation pipeline[/bold blue]")
     console.print(f"Run ID: {run_id}")
     console.print(f"Dataset: {dataset}")
     console.print(f"Model: {model}")
+    console.print(f"Max instances: {max_instances or 'all'}")
+    console.print(f"Skip evaluation: {skip_eval}")
+    console.print(f"Include control: {include_control}")
+    console.print("")
 
-    # Step 1: Generate baseline predictions
-    baseline_path = config.preds_dir / f"baseline_{run_id}.jsonl"
-    if not skip_baseline:
-        console.print("\n[bold]Step 1: Generating baseline predictions...[/bold]")
-        from .baseline.generator import BaselineGenerator
+    orchestrator = PipelineOrchestrator(config)
 
-        generator = BaselineGenerator(config)
-        generator.generate_all(output_path=baseline_path)
-    else:
-        console.print("\n[bold]Step 1: Skipping baseline (using existing)[/bold]")
+    try:
+        results = orchestrator.run_full_experiment(
+            run_id=run_id,
+            skip_evaluation=skip_eval,
+            include_control=include_control,
+        )
 
-    console.print(f"\n[green]Baseline predictions: {baseline_path}[/green]")
+        console.print(f"\n[bold green]Pipeline complete![/bold green]")
+        console.print(f"\n[bold]Output files:[/bold]")
+        console.print(f"  Baseline predictions: {results.baseline_predictions_path}")
+        console.print(f"  Cleanup predictions:  {results.cleanup_predictions_path}")
+        if results.control_predictions_path:
+            console.print(f"  Control predictions:  {results.control_predictions_path}")
+        console.print(f"  Diagnostics:          {results.diagnostics_path}")
 
-    # Note: Steps 2-6 require running SWE-bench evaluation
-    # which needs Docker and the swebench harness
-    if skip_eval:
-        console.print("\n[yellow]Skipping evaluation steps (--skip-eval)[/yellow]")
-        console.print("\nTo run full evaluation, use:")
-        console.print(f"  python -m swebench.harness.run_evaluation \\")
-        console.print(f"    --predictions_path {baseline_path} \\")
-        console.print(f"    --dataset_name {dataset} \\")
-        console.print(f"    --max_workers {max_workers} \\")
-        console.print(f"    --run_id {run_id}_baseline")
-    else:
-        console.print("\n[bold]Step 2: Running SWE-bench evaluation...[/bold]")
-        console.print("[yellow]Note: This requires swebench to be installed separately[/yellow]")
-        # The actual evaluation would be run via:
-        # python -m swebench.harness.run_evaluation ...
+        if results.baseline_results_path:
+            console.print(f"\n[bold]Evaluation results:[/bold]")
+            console.print(f"  Baseline: {results.baseline_results_path}")
+            console.print(f"  Cleanup:  {results.cleanup_results_path}")
+            if results.control_results_path:
+                console.print(f"  Control:  {results.control_results_path}")
 
-    console.print(f"\n[bold green]Pipeline setup complete![/bold green]")
+        if results.comparison:
+            console.print(f"\n[bold]Comparison:[/bold]")
+            results.comparison.print_table()
+            console.print(results.comparison.get_summary())
+
+        if results.forensics_path:
+            console.print(f"\n  Forensics report: {results.forensics_path}")
+
+    except Exception as e:
+        console.print(f"\n[bold red]Pipeline failed: {e}[/bold red]")
+        logger.exception("Pipeline failed")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

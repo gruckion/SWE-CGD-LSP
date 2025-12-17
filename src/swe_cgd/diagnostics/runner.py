@@ -128,6 +128,8 @@ class DiagnosticResult:
             "apply_error": self.apply_error,
             "syntax_errors": [e.to_dict() for e in self.syntax_errors],
             "type_errors": [e.to_dict() for e in self.type_errors],
+            "pyright_output": self.pyright_output,
+            "compileall_output": self.compileall_output,
             "summary": self.get_summary(),
         }
 
