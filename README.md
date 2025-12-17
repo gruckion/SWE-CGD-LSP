@@ -1,15 +1,59 @@
-# SWE-CGD-LSP: Code Generation with Diagnostics Validation
+# SWE-CGD-LSP: Preventing Workspace Consistency Violations in Agentic Code Editing
 
-A validation framework for testing the hypothesis that **diagnostic-guided cleanup** (LSP/type-checker feedback) improves code generation success rates on SWE-bench.
+A validation framework for testing the hypothesis that **preventing LSP-detectable semantic breakage from entering the agent loop** reduces cost per solve and improves pass@budget in agentic code editing.
 
 ## Hypothesis
 
-> A one-shot diagnostic cleanup pass (feeding type/syntax errors back to the LLM) is a more effective use of compute than generating independent samples.
+> **Agentic editing pipelines waste budget repairing predictable, workspace-detectable semantic breakage after the model has already conditioned on it.**
 
-This framework tests this by comparing:
-- **Baseline**: Single-shot patch generation
-- **Cleanup**: Baseline + one diagnostic-guided repair pass
-- **Control**: Two independent samples (for matched compute comparison)
+A material share of failures and cost blow-ups in instruction-based code editing are driven by early, non-transient "workspace consistency" violations—undefined symbols, signature mismatches, type errors, wrong imports, wrong member access—that are detectable via LSP/static tooling.
+
+If these violations are **prevented from reaching the outer agent loop** (or repaired before the agent continues), then:
+
+1. **pass@budget increases** — fewer runs die in repair loops before timeout
+2. **cost per solve decreases** — fewer tool calls, fewer iterations, less context churn
+
+See [HYPOTHESIS.md](./HYPOTHESIS.md) for the full hypothesis and validation approach.
+
+## Core Insight
+
+The proxy doesn't make the model smarter. It **stops it wasting budget on predictable breakage**.
+
+### Why This Matters
+
+- **Budgets are real** — Agents have max steps, tokens, timeouts. Runs that "would eventually fix it" fail by exhaustion.
+- **Context pollution degrades decisions** — Diagnostic dumps, partial patches, contradictory hypotheses push the model into worse action selection later.
+- **Every tool call is a failure opportunity** — Flaky tests, environment quirks, rate limits. Fewer calls = higher mechanical reliability.
+
+## Validation Approach
+
+This framework implements three experiments to get a go/no-go signal:
+
+### 1. Baseline Forensics
+*Is "early LSP error" predictive of failure/cost?*
+
+- Run baseline agent on SWE-bench tasks
+- Log when first LSP Error appears, whether it persists, total tool calls
+- Compute: P(fail | early LSP error) vs P(fail | no early LSP error)
+- Measure churn delta and ceiling (fraction of failures with early persistent errors)
+
+### 2. Counterfactual One-Shot Cleanup
+*Does fixing LSP errors actually rescue outcomes?*
+
+- Let baseline agent produce patch
+- Apply patch, run LSP diagnostics
+- If errors, one follow-up call to eliminate diagnostics
+- Re-run tests
+- If pass rate barely moves → thesis weakens. If it moves materially → real headroom.
+
+### 3. Lazy Proxy POC
+*Does preventing broken intermediate states reduce churn?*
+
+- Buffer model output fully
+- Apply it to workspace
+- Run LSP diagnostics
+- If violations exceed threshold, trigger hidden repair loop
+- Only return clean output to outer agent
 
 ## Quick Start
 
@@ -35,10 +79,6 @@ chmod +x scripts/setup_swebench.sh
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-
-# Clone SWE-bench (if not using setup script)
-git clone https://github.com/SWE-bench/SWE-bench.git ../SWE-bench
-pip install -e ../SWE-bench
 ```
 
 ### Set API Key
@@ -49,17 +89,6 @@ export ANTHROPIC_API_KEY=your-key
 export OPENAI_API_KEY=your-key
 ```
 
-### Validate SWE-bench Setup
-
-```bash
-# Run gold patch test (proves Docker + harness works)
-python -m swebench.harness.run_evaluation \
-  --predictions_path gold \
-  --max_workers 1 \
-  --instance_ids sympy__sympy-20590 \
-  --run_id validate-gold
-```
-
 ## Usage
 
 ### CLI Commands
@@ -68,67 +97,80 @@ python -m swebench.harness.run_evaluation \
 # Generate baseline predictions
 swe-cgd baseline --max 20 --output preds/baseline.jsonl
 
-# Generate cleanup predictions (after running diagnostics)
+# Run diagnostics and generate cleanup predictions
 swe-cgd cleanup preds/baseline.jsonl output/diagnostics.jsonl
 
-# Compare results
+# Collect forensics (predictiveness analysis)
+swe-cgd forensics run_id --logs-dir logs --output output/forensics.json
+
+# Compare results (cost + pass rate)
 swe-cgd compare evaluation_results/baseline/results.json \
                 evaluation_results/cleanup/results.json
 
-# Collect forensics from evaluation logs
-swe-cgd forensics run_id --logs-dir logs --output output/forensics.json
-
-# Run full pipeline (orchestrated)
-swe-cgd run-pipeline --max 20 --skip-eval  # Skip eval for dry run
+# Run full pipeline
+swe-cgd run-pipeline --max 20
 ```
 
 ### Full Experiment
 
 ```bash
-# Set configuration
-export DATASET="princeton-nlp/SWE-bench_Lite"
-export MODEL="claude-sonnet-4-20250514"
-export MAX_INSTANCES=20
-
-# Run experiment
 ./scripts/run_experiment.sh
 ```
 
-## Pipeline Architecture
+## Key Metrics
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    CGD Validation Pipeline                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. Baseline Generation                                          │
-│     └─> LLM generates patch from issue description               │
-│                                                                  │
-│  2. SWE-bench Evaluation (baseline)                              │
-│     └─> Run tests in Docker containers                           │
-│                                                                  │
-│  3. Diagnostics Collection                                       │
-│     ├─> Apply patch in container                                 │
-│     ├─> Run pyright (type checker)                               │
-│     └─> Run compileall (syntax check)                            │
-│                                                                  │
-│  4. Cleanup Generation                                           │
-│     └─> LLM repairs patch using diagnostic feedback              │
-│                                                                  │
-│  5. SWE-bench Evaluation (cleanup)                               │
-│     └─> Run tests on cleaned patches                             │
-│                                                                  │
-│  6. Results Comparison                                           │
-│     ├─> Baseline pass rate vs Cleanup pass rate                  │
-│     ├─> Improved instances (failed→resolved)                     │
-│     └─> Regressed instances (resolved→failed)                    │
-│                                                                  │
-│  7. Forensics Report                                             │
-│     ├─> Which failures had detectable diagnostics?               │
-│     └─> Correlation analysis                                     │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Headline Metric
+
+**Cost per solved task** = (tokens + tool calls + wall time) / #solved
+
+### Secondary Metrics
+
+| Metric | Description |
+|--------|-------------|
+| pass@budget | Pass rate under fixed budget constraints |
+| Tool-call count | Total tool invocations |
+| Failed-tool-call count | Tool calls that errored |
+| Churn delta | Extra tool calls after first LSP error |
+| Variance / tail risk | Frequency of token blow-ups |
+
+### Forensics Metrics
+
+| Metric | Description |
+|--------|-------------|
+| P(fail \| early LSP error) | Failure rate when early error present |
+| P(fail \| no early LSP error) | Failure rate when no early error |
+| Ceiling | Fraction of failures with early persistent errors |
+
+## Evaluation Regimes
+
+### 1. Unbounded / Generous Budget
+- Expect: pass rate may be similar
+- Measure: cost per solve, tool calls, variance
+
+### 2. Fixed-Budget (What Matters Economically)
+- Cap max tool calls / wall time / tokens
+- Expect: if proxy provides value, pass@budget increases
+
+## Two Possible Outcomes
+
+### Hypothesis A: Cost Reduction Only (Still Valuable)
+- Pass rate stays ~flat
+- Cost per solve drops significantly
+- Strong product wedge if delta is large
+
+### Hypothesis B: Cost Reduction + Pass@Budget Improvement
+- Pass rate improves under fixed budgets
+- Cost per solve also drops
+- The stronger, more defensible story
+
+## Decision Gate
+
+If baseline forensics + one-shot cleanup cannot show:
+
+1. Early LSP Error is **common** in failures, AND
+2. Eliminating it often **rescues the run or reduces churn**
+
+...then the thesis is not strong enough to justify deeper engineering.
 
 ## Project Structure
 
@@ -136,67 +178,43 @@ export MAX_INSTANCES=20
 SWE-CGD-LSP/
 ├── src/swe_cgd/
 │   ├── baseline/           # Baseline prediction generation
-│   │   └── generator.py    # LLM-based patch generator
-│   ├── diagnostics/        # Static analysis / type checking
-│   │   ├── runner.py       # Local pyright runner
+│   ├── diagnostics/        # LSP / static analysis
+│   │   ├── runner.py       # Local diagnostics runner
 │   │   └── docker_runner.py # Docker-based diagnostics
 │   ├── cleanup/            # Diagnostic-guided repair
-│   │   └── cleaner.py      # One-shot cleanup logic
 │   ├── evaluation/         # Results analysis
-│   │   ├── forensics.py    # Log analysis
-│   │   └── comparison.py   # A/B comparison
+│   │   ├── forensics.py    # Predictiveness analysis
+│   │   └── comparison.py   # Cost + pass rate comparison
 │   ├── pipeline/           # Orchestration
-│   │   └── orchestrator.py # Full pipeline runner
-│   ├── utils/              # Shared utilities
-│   │   ├── config.py       # Configuration
-│   │   └── logging.py      # Rich logging
 │   └── cli.py              # Typer CLI
 ├── scripts/
 │   ├── setup_swebench.sh   # Setup script
-│   ├── run_experiment.sh   # Full experiment runner
-│   └── quick_test.py       # Quick local tests
-├── preds/                  # Prediction JSONL files
-├── output/                 # Analysis outputs
-├── logs/                   # SWE-bench logs
-└── pyproject.toml          # Project configuration
+│   └── run_experiment.sh   # Full experiment runner
+├── HYPOTHESIS.md           # Full hypothesis documentation
+└── pyproject.toml
 ```
 
-## Configuration
+## Claude Code Integration Notes
 
-Environment variables:
-- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`: LLM API key
-- `SWE_CGD_MODEL`: Model name (default: `claude-sonnet-4-20250514`)
-- `SWE_CGD_DATASET`: Dataset (default: `princeton-nlp/SWE-bench_Lite`)
+For Claude Code specifically, the intervention focuses on:
 
-## Datasets
+- **Tool-use correctness** — Anthropic tool_use ↔ tool_result pairing must be preserved
+- **File-edit tool schemas** — Read/Edit/Write operations
+- **Workspace consistency gates** — Around file edits + commands
 
-| Dataset | Description | Recommended For |
-|---------|-------------|-----------------|
-| `princeton-nlp/SWE-bench_Lite` | 300 instances, faster | Initial validation |
-| `princeton-nlp/SWE-bench` | Full 2,294 instances | Complete experiments |
-| `princeton-nlp/SWE-bench_Verified` | Curated "solvable" subset | Quality analysis |
+This avoids diff-grammar work and focuses on preventing broken intermediate states from entering the tool loop.
 
-## Key Metrics
+## Scope
 
-1. **Pass Rate**: % of instances where tests pass
-2. **Improvement Rate**: % of baseline failures fixed by cleanup
-3. **Regression Rate**: % of baseline passes broken by cleanup
-4. **Diagnostic Coverage**: % of failures that had detectable type/syntax errors
+### What LSP Diagnostics Catch
 
-## Interpreting Results
+- Undefined symbols
+- Signature mismatches
+- Type errors
+- Wrong imports
+- Wrong member access
 
-The hypothesis is validated if:
-1. Cleanup pass rate > Baseline pass rate
-2. Improvement rate > Regression rate
-3. Many failures had detectable diagnostics (coverage)
-
-Strong validation if:
-- Cleanup outperforms Control (matched compute comparison)
-- Improvement correlates with diagnostic signal presence
-
-## Extending to Other Languages
-
-The framework is designed to support multilingual diagnostics:
+### Language Support
 
 | Language | Diagnostics Tool | Status |
 |----------|------------------|--------|
@@ -205,36 +223,13 @@ The framework is designed to support multilingual diagnostics:
 | Go | gopls | Planned |
 | Rust | rust-analyzer | Planned |
 
-For multilingual SWE-bench, use the multilingual dataset variant.
-
-## Troubleshooting
-
-### Docker Issues
-```bash
-# Check Docker is running
-docker run --rm hello-world
-
-# Check disk space (need ~120GB)
-df -h
-```
-
-### SWE-bench Import Errors
-```bash
-# Reinstall SWE-bench
-pip install -e ../SWE-bench
-```
-
-### API Rate Limits
-The pipeline uses exponential backoff for retries. For large runs, consider:
-- Using batch API endpoints
-- Running overnight
-- Reducing `--max-workers`
+LSP interface is standardized, but server quality varies by ecosystem.
 
 ## References
 
-- [SWE-bench Paper](https://arxiv.org/abs/2310.06770)
-- [SWE-bench Repository](https://github.com/SWE-bench/SWE-bench)
-- [Pyright](https://github.com/microsoft/pyright)
+- [HYPOTHESIS.md](./HYPOTHESIS.md) — Full hypothesis and validation approach
+- [SWE-bench](https://github.com/SWE-bench/SWE-bench)
+- [LSP Specification](https://microsoft.github.io/language-server-protocol/)
 
 ## License
 
