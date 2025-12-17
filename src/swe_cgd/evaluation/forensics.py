@@ -1,12 +1,12 @@
-"""Forensics collection for failed predictions."""
+"""Forensics collection and analysis for hypothesis validation."""
 
 import json
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
 
+from ..baseline.generator import CostMetrics
 from ..utils.config import Config
 from ..utils.logging import get_logger
 
@@ -24,18 +24,27 @@ class InstanceForensics:
     tests_failed: int = 0
     test_errors: list[str] = field(default_factory=list)
 
-    # Diagnostic analysis (if we ran it)
+    # Diagnostic analysis
     had_syntax_errors: bool = False
     had_type_errors: bool = False
     diagnostic_error_count: int = 0
     diagnostic_summary: str = ""
 
+    # Cost metrics (if available)
+    cost_metrics: Optional[CostMetrics] = None
+    repair_iterations: int = 0
+
     # From SWE-bench logs
     build_log_excerpt: str = ""
     test_log_excerpt: str = ""
 
+    @property
+    def had_diagnostic_issues(self) -> bool:
+        """Did this instance have any diagnostic issues?"""
+        return self.had_syntax_errors or self.had_type_errors
+
     def to_dict(self) -> dict:
-        return {
+        result = {
             "instance_id": self.instance_id,
             "status": self.status,
             "patch_applied": self.patch_applied,
@@ -44,9 +53,182 @@ class InstanceForensics:
             "test_errors": self.test_errors,
             "had_syntax_errors": self.had_syntax_errors,
             "had_type_errors": self.had_type_errors,
+            "had_diagnostic_issues": self.had_diagnostic_issues,
             "diagnostic_error_count": self.diagnostic_error_count,
             "diagnostic_summary": self.diagnostic_summary,
+            "repair_iterations": self.repair_iterations,
         }
+        if self.cost_metrics:
+            result["cost_metrics"] = self.cost_metrics.to_dict()
+        return result
+
+
+@dataclass
+class PredictiveMetrics:
+    """Metrics for evaluating hypothesis: is early LSP error predictive of failure?"""
+
+    # Counts for conditional probability calculation
+    total_instances: int = 0
+    total_with_diagnostic_issues: int = 0
+    total_without_diagnostic_issues: int = 0
+
+    failed_with_diagnostic_issues: int = 0
+    failed_without_diagnostic_issues: int = 0
+    resolved_with_diagnostic_issues: int = 0
+    resolved_without_diagnostic_issues: int = 0
+
+    @property
+    def p_fail_given_error(self) -> float:
+        """P(fail | early LSP error) - probability of failure given diagnostic issues."""
+        if self.total_with_diagnostic_issues == 0:
+            return 0.0
+        return self.failed_with_diagnostic_issues / self.total_with_diagnostic_issues
+
+    @property
+    def p_fail_given_no_error(self) -> float:
+        """P(fail | no early LSP error) - probability of failure without diagnostic issues."""
+        if self.total_without_diagnostic_issues == 0:
+            return 0.0
+        return self.failed_without_diagnostic_issues / self.total_without_diagnostic_issues
+
+    @property
+    def predictiveness_ratio(self) -> float:
+        """Ratio of P(fail|error) / P(fail|no error). >1 means errors are predictive of failure."""
+        if self.p_fail_given_no_error == 0:
+            return float('inf') if self.p_fail_given_error > 0 else 1.0
+        return self.p_fail_given_error / self.p_fail_given_no_error
+
+    @property
+    def ceiling(self) -> float:
+        """Fraction of failures that had early persistent LSP errors (fixable headroom)."""
+        total_failures = self.failed_with_diagnostic_issues + self.failed_without_diagnostic_issues
+        if total_failures == 0:
+            return 0.0
+        return self.failed_with_diagnostic_issues / total_failures
+
+    @property
+    def diagnostic_issue_rate(self) -> float:
+        """What fraction of all instances had diagnostic issues?"""
+        if self.total_instances == 0:
+            return 0.0
+        return self.total_with_diagnostic_issues / self.total_instances
+
+    def to_dict(self) -> dict:
+        return {
+            "total_instances": self.total_instances,
+            "total_with_diagnostic_issues": self.total_with_diagnostic_issues,
+            "total_without_diagnostic_issues": self.total_without_diagnostic_issues,
+            "failed_with_diagnostic_issues": self.failed_with_diagnostic_issues,
+            "failed_without_diagnostic_issues": self.failed_without_diagnostic_issues,
+            "resolved_with_diagnostic_issues": self.resolved_with_diagnostic_issues,
+            "resolved_without_diagnostic_issues": self.resolved_without_diagnostic_issues,
+            "p_fail_given_error": self.p_fail_given_error,
+            "p_fail_given_no_error": self.p_fail_given_no_error,
+            "predictiveness_ratio": self.predictiveness_ratio,
+            "ceiling": self.ceiling,
+            "diagnostic_issue_rate": self.diagnostic_issue_rate,
+        }
+
+    def get_summary(self) -> str:
+        return f"""
+Predictive Metrics (Hypothesis Validation)
+==========================================
+Total instances: {self.total_instances}
+  With diagnostic issues: {self.total_with_diagnostic_issues} ({self.diagnostic_issue_rate:.1%})
+  Without diagnostic issues: {self.total_without_diagnostic_issues}
+
+Conditional Failure Rates:
+  P(fail | LSP error):    {self.p_fail_given_error:.1%}
+  P(fail | no LSP error): {self.p_fail_given_no_error:.1%}
+  Predictiveness ratio:   {self.predictiveness_ratio:.2f}x
+
+Ceiling (fixable headroom):
+  {self.ceiling:.1%} of failures had detectable LSP errors
+
+Interpretation:
+  - Predictiveness ratio > 1.0 means LSP errors predict failure
+  - Higher ceiling = more headroom for the intervention
+"""
+
+
+@dataclass
+class CostAnalysis:
+    """Cost analysis across instances."""
+
+    total_tokens: int = 0
+    total_wall_time: float = 0.0
+    total_llm_calls: int = 0
+    total_failed_calls: int = 0
+    total_repair_iterations: int = 0
+
+    # Per-outcome breakdown
+    tokens_for_resolved: int = 0
+    tokens_for_failed: int = 0
+    instances_resolved: int = 0
+    instances_failed: int = 0
+
+    @property
+    def cost_per_solved(self) -> float:
+        """Average tokens per solved instance (headline metric)."""
+        if self.instances_resolved == 0:
+            return float('inf')
+        return self.tokens_for_resolved / self.instances_resolved
+
+    @property
+    def cost_per_failed(self) -> float:
+        """Average tokens per failed instance."""
+        if self.instances_failed == 0:
+            return 0.0
+        return self.tokens_for_failed / self.instances_failed
+
+    @property
+    def cost_per_instance(self) -> float:
+        """Average tokens per instance overall."""
+        total = self.instances_resolved + self.instances_failed
+        if total == 0:
+            return 0.0
+        return self.total_tokens / total
+
+    @property
+    def avg_repair_iterations(self) -> float:
+        """Average repair iterations per instance."""
+        total = self.instances_resolved + self.instances_failed
+        if total == 0:
+            return 0.0
+        return self.total_repair_iterations / total
+
+    def to_dict(self) -> dict:
+        return {
+            "total_tokens": self.total_tokens,
+            "total_wall_time_seconds": self.total_wall_time,
+            "total_llm_calls": self.total_llm_calls,
+            "total_failed_calls": self.total_failed_calls,
+            "total_repair_iterations": self.total_repair_iterations,
+            "tokens_for_resolved": self.tokens_for_resolved,
+            "tokens_for_failed": self.tokens_for_failed,
+            "instances_resolved": self.instances_resolved,
+            "instances_failed": self.instances_failed,
+            "cost_per_solved": self.cost_per_solved if self.instances_resolved > 0 else None,
+            "cost_per_failed": self.cost_per_failed if self.instances_failed > 0 else None,
+            "cost_per_instance": self.cost_per_instance,
+            "avg_repair_iterations": self.avg_repair_iterations,
+        }
+
+    def get_summary(self) -> str:
+        return f"""
+Cost Analysis (Headline Metrics)
+================================
+Total tokens: {self.total_tokens:,}
+Total wall time: {self.total_wall_time:.1f}s
+Total LLM calls: {self.total_llm_calls}
+Failed calls: {self.total_failed_calls}
+Total repair iterations: {self.total_repair_iterations}
+
+Cost per solved task: {self.cost_per_solved:,.0f} tokens (HEADLINE METRIC)
+Cost per failed task: {self.cost_per_failed:,.0f} tokens
+Cost per instance: {self.cost_per_instance:,.0f} tokens
+Avg repair iterations: {self.avg_repair_iterations:.2f}
+"""
 
 
 @dataclass
@@ -63,25 +245,72 @@ class ForensicsReport:
 
     instances: list[InstanceForensics] = field(default_factory=list)
 
-    # Aggregated analysis
+    # Predictive metrics (hypothesis validation)
+    predictive_metrics: PredictiveMetrics = field(default_factory=PredictiveMetrics)
+
+    # Cost analysis
+    cost_analysis: CostAnalysis = field(default_factory=CostAnalysis)
+
+    # Legacy fields for backward compatibility
     failures_with_diagnostic_issues: int = 0
     failures_without_diagnostic_issues: int = 0
 
     def add_instance(self, forensics: InstanceForensics) -> None:
         self.instances.append(forensics)
 
+        # Update counts
         if forensics.status == "resolved":
             self.resolved += 1
         elif forensics.status == "failed":
             self.failed += 1
-            if forensics.had_syntax_errors or forensics.had_type_errors:
-                self.failures_with_diagnostic_issues += 1
-            else:
-                self.failures_without_diagnostic_issues += 1
         elif forensics.status == "error":
             self.errors += 1
         elif forensics.status == "timeout":
             self.timeouts += 1
+
+    def compute_metrics(self) -> None:
+        """Compute all derived metrics from instance data."""
+        # Reset metrics
+        self.predictive_metrics = PredictiveMetrics()
+        self.cost_analysis = CostAnalysis()
+
+        for inst in self.instances:
+            self.predictive_metrics.total_instances += 1
+
+            has_issues = inst.had_diagnostic_issues
+
+            if has_issues:
+                self.predictive_metrics.total_with_diagnostic_issues += 1
+                if inst.status == "failed":
+                    self.predictive_metrics.failed_with_diagnostic_issues += 1
+                elif inst.status == "resolved":
+                    self.predictive_metrics.resolved_with_diagnostic_issues += 1
+            else:
+                self.predictive_metrics.total_without_diagnostic_issues += 1
+                if inst.status == "failed":
+                    self.predictive_metrics.failed_without_diagnostic_issues += 1
+                elif inst.status == "resolved":
+                    self.predictive_metrics.resolved_without_diagnostic_issues += 1
+
+            # Cost analysis
+            if inst.cost_metrics:
+                self.cost_analysis.total_tokens += inst.cost_metrics.total_tokens
+                self.cost_analysis.total_wall_time += inst.cost_metrics.wall_time_seconds
+                self.cost_analysis.total_llm_calls += inst.cost_metrics.llm_calls
+                self.cost_analysis.total_failed_calls += inst.cost_metrics.failed_calls
+
+                if inst.status == "resolved":
+                    self.cost_analysis.tokens_for_resolved += inst.cost_metrics.total_tokens
+                    self.cost_analysis.instances_resolved += 1
+                elif inst.status == "failed":
+                    self.cost_analysis.tokens_for_failed += inst.cost_metrics.total_tokens
+                    self.cost_analysis.instances_failed += 1
+
+            self.cost_analysis.total_repair_iterations += inst.repair_iterations
+
+        # Update legacy fields
+        self.failures_with_diagnostic_issues = self.predictive_metrics.failed_with_diagnostic_issues
+        self.failures_without_diagnostic_issues = self.predictive_metrics.failed_without_diagnostic_issues
 
     @property
     def pass_rate(self) -> float:
@@ -102,9 +331,8 @@ Results:
   Errors: {self.errors}
   Timeouts: {self.timeouts}
 
-Failure Analysis:
-  With diagnostic issues: {self.failures_with_diagnostic_issues}
-  Without diagnostic issues: {self.failures_without_diagnostic_issues}
+{self.predictive_metrics.get_summary()}
+{self.cost_analysis.get_summary()}
 """
 
     def to_dict(self) -> dict:
@@ -117,6 +345,9 @@ Failure Analysis:
             "errors": self.errors,
             "timeouts": self.timeouts,
             "pass_rate": self.pass_rate,
+            "predictive_metrics": self.predictive_metrics.to_dict(),
+            "cost_analysis": self.cost_analysis.to_dict(),
+            # Legacy fields
             "failures_with_diagnostic_issues": self.failures_with_diagnostic_issues,
             "failures_without_diagnostic_issues": self.failures_without_diagnostic_issues,
             "instances": [inst.to_dict() for inst in self.instances],
@@ -142,16 +373,7 @@ class ForensicsCollector:
         logs_dir: Path,
         results_file: Optional[Path] = None,
     ) -> ForensicsReport:
-        """Collect forensics from SWE-bench evaluation logs.
-
-        Args:
-            run_id: The run ID used in evaluation
-            logs_dir: Directory containing SWE-bench logs
-            results_file: Optional path to results JSON
-
-        Returns:
-            ForensicsReport with aggregated data
-        """
+        """Collect forensics from SWE-bench evaluation logs."""
         report = ForensicsReport(
             run_id=run_id,
             timestamp=datetime.now().isoformat(),
@@ -163,12 +385,10 @@ class ForensicsCollector:
         )
 
         # Load results if available and build status mapping
-        # SWE-bench results.json format: {"resolved": [...], "failed": [...], "error": [...]}
         status_by_instance: dict[str, str] = {}
         if results_file and results_file.exists():
             with open(results_file) as f:
                 results = json.load(f)
-                # Build instance_id -> status mapping from SWE-bench list format
                 for instance_id in results.get("resolved", []):
                     status_by_instance[instance_id] = "resolved"
                 for instance_id in results.get("failed", []):
@@ -186,7 +406,6 @@ class ForensicsCollector:
                 instance_id = instance_dir.name
                 report.total_instances += 1
 
-                # Get status from results mapping
                 status = status_by_instance.get(instance_id, "unknown")
                 forensics = self._analyze_instance_logs(
                     instance_id,
@@ -195,6 +414,7 @@ class ForensicsCollector:
                 )
                 report.add_instance(forensics)
 
+        report.compute_metrics()
         return report
 
     def _analyze_instance_logs(
@@ -203,13 +423,7 @@ class ForensicsCollector:
         instance_dir: Path,
         status_from_results: str,
     ) -> InstanceForensics:
-        """Analyze logs for a single instance.
-
-        Args:
-            instance_id: The instance ID
-            instance_dir: Directory containing instance logs
-            status_from_results: Status from SWE-bench results (resolved/failed/error/unknown)
-        """
+        """Analyze logs for a single instance."""
         forensics = InstanceForensics(
             instance_id=instance_id,
             status=status_from_results if status_from_results != "unknown" else "unknown",
@@ -221,14 +435,12 @@ class ForensicsCollector:
             content = test_output.read_text()
             forensics.test_log_excerpt = content[-2000:] if len(content) > 2000 else content
 
-            # Parse test results (basic heuristics) - only if we don't have explicit status
             if forensics.status == "unknown":
                 if "PASSED" in content or "OK" in content:
                     forensics.status = "resolved"
                 elif "FAILED" in content or "ERROR" in content:
                     forensics.status = "failed"
 
-            # Count test results regardless
             forensics.tests_failed = content.count("FAILED")
             forensics.tests_passed = content.count("PASSED")
 
@@ -245,15 +457,7 @@ class ForensicsCollector:
         report: ForensicsReport,
         diagnostics_file: Path,
     ) -> ForensicsReport:
-        """Enrich forensics report with diagnostic data.
-
-        Args:
-            report: Base forensics report
-            diagnostics_file: JSONL file with diagnostic results
-
-        Returns:
-            Enriched report
-        """
+        """Enrich forensics report with diagnostic data."""
         if not diagnostics_file.exists():
             logger.warning(f"Diagnostics file not found: {diagnostics_file}")
             return report
@@ -277,16 +481,107 @@ class ForensicsCollector:
                 )
                 instance.diagnostic_summary = diag.get("summary", "")
 
-        # Recalculate aggregates
-        report.failures_with_diagnostic_issues = sum(
-            1
-            for inst in report.instances
-            if inst.status == "failed" and (inst.had_syntax_errors or inst.had_type_errors)
+        # Recompute metrics with enriched data
+        report.compute_metrics()
+        return report
+
+    def enrich_with_predictions(
+        self,
+        report: ForensicsReport,
+        predictions_file: Path,
+    ) -> ForensicsReport:
+        """Enrich forensics report with prediction cost data."""
+        if not predictions_file.exists():
+            logger.warning(f"Predictions file not found: {predictions_file}")
+            return report
+
+        # Load predictions
+        predictions_map = {}
+        with open(predictions_file) as f:
+            for line in f:
+                if line.strip():
+                    data = json.loads(line)
+                    predictions_map[data["instance_id"]] = data
+
+        # Enrich instances with cost metrics
+        for instance in report.instances:
+            if instance.instance_id in predictions_map:
+                pred = predictions_map[instance.instance_id]
+                if "cost_metrics" in pred:
+                    instance.cost_metrics = CostMetrics.from_dict(pred["cost_metrics"])
+                instance.repair_iterations = pred.get("repair_iterations", 0)
+
+        # Recompute metrics with enriched data
+        report.compute_metrics()
+        return report
+
+
+def evaluate_decision_gate(report: ForensicsReport) -> dict:
+    """
+    Evaluate the decision gate criteria from the hypothesis.
+
+    Returns a dict with:
+    - gate_passed: bool - whether the thesis is supported
+    - criteria: dict - individual criteria evaluations
+    - recommendation: str - what to do next
+    """
+    pm = report.predictive_metrics
+
+    # Criterion 1: Early LSP Error is COMMON in failures
+    # "Common" = at least 30% of failures had diagnostic issues
+    criterion_1_threshold = 0.30
+    criterion_1_value = pm.ceiling
+    criterion_1_passed = criterion_1_value >= criterion_1_threshold
+
+    # Criterion 2: LSP errors are PREDICTIVE of failure
+    # Predictive = P(fail|error) > P(fail|no error) by meaningful margin
+    criterion_2_threshold = 1.2  # At least 20% more likely to fail
+    criterion_2_value = pm.predictiveness_ratio
+    criterion_2_passed = criterion_2_value >= criterion_2_threshold
+
+    # Overall gate
+    gate_passed = criterion_1_passed and criterion_2_passed
+
+    if gate_passed:
+        recommendation = (
+            "PROCEED: The data supports the hypothesis. "
+            "LSP errors are common in failures and predictive of failure. "
+            "Consider implementing the lazy proxy POC."
         )
-        report.failures_without_diagnostic_issues = sum(
-            1
-            for inst in report.instances
-            if inst.status == "failed" and not (inst.had_syntax_errors or inst.had_type_errors)
+    elif criterion_1_passed and not criterion_2_passed:
+        recommendation = (
+            "WEAK SIGNAL: LSP errors are common but not strongly predictive. "
+            "The intervention may have limited impact. "
+            "Consider investigating why errors don't predict failure."
+        )
+    elif not criterion_1_passed and criterion_2_passed:
+        recommendation = (
+            "LIMITED HEADROOM: LSP errors predict failure but are rare. "
+            "The ceiling for improvement is low. "
+            "Consider expanding diagnostic coverage."
+        )
+    else:
+        recommendation = (
+            "DO NOT PROCEED: LSP errors are neither common nor predictive. "
+            "The thesis is not supported by the data. "
+            "Consider pivoting to a different approach."
         )
 
-        return report
+    return {
+        "gate_passed": gate_passed,
+        "criteria": {
+            "errors_common_in_failures": {
+                "passed": criterion_1_passed,
+                "value": criterion_1_value,
+                "threshold": criterion_1_threshold,
+                "description": f"Ceiling >= {criterion_1_threshold:.0%}",
+            },
+            "errors_predictive_of_failure": {
+                "passed": criterion_2_passed,
+                "value": criterion_2_value,
+                "threshold": criterion_2_threshold,
+                "description": f"Predictiveness ratio >= {criterion_2_threshold:.1f}x",
+            },
+        },
+        "recommendation": recommendation,
+    }
