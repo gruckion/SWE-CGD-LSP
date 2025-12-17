@@ -146,12 +146,20 @@ class PipelineOrchestrator:
         self,
         predictions_path: Path,
         output_path: Path,
+        use_docker: bool = True,
     ) -> None:
         """Generate diagnostics by running pyright inside SWE-bench containers.
 
-        This is the key integration point - we need to run diagnostics
+        This is the key integration point - we run diagnostics
         inside the same Docker containers that SWE-bench uses.
+
+        Args:
+            predictions_path: Path to predictions JSONL
+            output_path: Path to write diagnostics JSONL
+            use_docker: If True, run in Docker containers; if False, run locally (for testing)
         """
+        from ..diagnostics.docker_runner import DockerDiagnosticsRunner
+
         # Load predictions
         predictions = []
         with open(predictions_path) as f:
@@ -159,37 +167,43 @@ class PipelineOrchestrator:
                 if line.strip():
                     predictions.append(json.loads(line))
 
-        diagnostics = []
-        for pred in predictions:
-            instance_id = pred["instance_id"]
-            patch = pred["model_patch"]
+        docker_runner = DockerDiagnosticsRunner(
+            timeout=self.config.diagnostics.timeout_seconds
+        )
 
-            # For each prediction, we would:
-            # 1. Start the SWE-bench container for this instance
-            # 2. Apply the patch
-            # 3. Run pyright inside the container
-            # 4. Collect the output
-
-            # This is a simplified version - full implementation would
-            # use the SWE-bench Docker infrastructure
-            logger.info(f"Collecting diagnostics for {instance_id}")
-
-            diag_result = DiagnosticResult(
-                instance_id=instance_id,
-                patch_applied=bool(patch.strip()),
-            )
-
-            # Parse the patch to identify changed files
-            changed_files = self.diagnostics_runner.get_changed_files(patch)
-            logger.debug(f"Changed files: {changed_files}")
-
-            diagnostics.append(diag_result.to_dict())
-
-        # Save diagnostics
         output_path.parent.mkdir(parents=True, exist_ok=True)
+
         with open(output_path, "w") as f:
-            for diag in diagnostics:
-                f.write(json.dumps(diag) + "\n")
+            for pred in predictions:
+                instance_id = pred["instance_id"]
+                patch = pred["model_patch"]
+
+                logger.info(f"Collecting diagnostics for {instance_id}")
+
+                if use_docker:
+                    # Run diagnostics in Docker container
+                    try:
+                        diag_result = docker_runner.run_in_container(instance_id, patch)
+                    except Exception as e:
+                        logger.error(f"Docker diagnostics failed for {instance_id}: {e}")
+                        # Fall back to basic patch analysis
+                        diag_result = DiagnosticResult(
+                            instance_id=instance_id,
+                            patch_applied=False,
+                            apply_error=f"Docker error: {e}",
+                        )
+                else:
+                    # Basic diagnostics without Docker (for testing)
+                    changed_files = self.diagnostics_runner.get_changed_files(patch)
+                    diag_result = DiagnosticResult(
+                        instance_id=instance_id,
+                        patch_applied=bool(patch.strip()) and bool(changed_files),
+                        apply_error="Empty patch" if not patch.strip() else None,
+                    )
+
+                logger.debug(f"Diagnostics for {instance_id}: {diag_result.get_summary()}")
+                f.write(json.dumps(diag_result.to_dict()) + "\n")
+                f.flush()
 
         logger.info(f"Saved diagnostics to {output_path}")
 
@@ -328,18 +342,13 @@ class PipelineOrchestrator:
                     data = json.loads(line)
                     predictions[data["instance_id"]] = Prediction(**data)
 
-        # Load diagnostics
+        # Load diagnostics - properly parse all fields including errors
         diagnostics = {}
         with open(diagnostics_path) as f:
             for line in f:
                 if line.strip():
                     data = json.loads(line)
-                    diag = DiagnosticResult(
-                        instance_id=data["instance_id"],
-                        patch_applied=data.get("patch_applied", False),
-                        apply_error=data.get("apply_error"),
-                    )
-                    diagnostics[data["instance_id"]] = diag
+                    diagnostics[data["instance_id"]] = DiagnosticResult.from_dict(data)
 
         # Generate cleaned predictions
         output_path.parent.mkdir(parents=True, exist_ok=True)

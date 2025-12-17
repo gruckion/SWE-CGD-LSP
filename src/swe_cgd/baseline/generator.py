@@ -76,16 +76,18 @@ class BaselineGenerator:
         if self._dataset is None:
             self.load_dataset()
 
-        for idx, instance in enumerate(self._dataset):
+        yielded_count = 0
+        for instance in self._dataset:
             # Filter by instance_ids if specified
             if self.config.instance_ids:
                 if instance["instance_id"] not in self.config.instance_ids:
                     continue
 
-            # Limit by max_instances if specified
-            if self.config.max_instances and idx >= self.config.max_instances:
+            # Limit by max_instances (count of yielded items, not dataset index)
+            if self.config.max_instances and yielded_count >= self.config.max_instances:
                 break
 
+            yielded_count += 1
             yield instance
 
     @retry(

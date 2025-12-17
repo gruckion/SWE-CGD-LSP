@@ -80,19 +80,13 @@ def cleanup(
                 data = json.loads(line)
                 predictions[data["instance_id"]] = Prediction(**data)
 
-    # Load diagnostics
+    # Load diagnostics - properly parse all fields including errors
     diagnostics = {}
     with open(diagnostics_file) as f:
         for line in f:
             if line.strip():
                 data = json.loads(line)
-                diagnostics[data["instance_id"]] = DiagnosticResult(
-                    instance_id=data["instance_id"],
-                    patch_applied=data.get("patch_applied", False),
-                    apply_error=data.get("apply_error"),
-                    syntax_errors=[],
-                    type_errors=[],
-                )
+                diagnostics[data["instance_id"]] = DiagnosticResult.from_dict(data)
 
     # Load dataset for instance details
     ds = load_dataset(dataset, split="test")

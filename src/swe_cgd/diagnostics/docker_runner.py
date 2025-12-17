@@ -30,19 +30,33 @@ git apply /tmp/patch.diff 2>/tmp/apply.txt || {
     exit 1
 }
 
-# Run compileall on changed files
+# Get changed Python files from working tree (not HEAD~1 which compares commits)
+CHANGED_FILES=$(git diff --name-only | grep '\\.py$' || true)
+
+# Run py_compile on changed files (syntax check)
 echo "=== COMPILEALL OUTPUT ==="
-python -m compileall -q $(git diff --name-only HEAD~1 | grep '\\.py$' || echo "") 2>&1 || true
+if [ -n "$CHANGED_FILES" ]; then
+    for f in $CHANGED_FILES; do
+        if [ -f "$f" ]; then
+            python -m py_compile "$f" 2>&1 || true
+        fi
+    done
+else
+    echo "No Python files changed"
+fi
 
 # Run pyright if available
-if command -v pyright &> /dev/null; then
-    echo "=== PYRIGHT OUTPUT ==="
-    pyright --outputjson $(git diff --name-only HEAD~1 | grep '\\.py$' || echo "") 2>&1 || true
-elif [ -f /usr/local/bin/pyright ] || pip show pyright > /dev/null 2>&1; then
-    echo "=== PYRIGHT OUTPUT ==="
-    python -m pyright --outputjson $(git diff --name-only HEAD~1 | grep '\\.py$' || echo "") 2>&1 || true
+echo "=== PYRIGHT OUTPUT ==="
+if [ -n "$CHANGED_FILES" ]; then
+    if command -v pyright &> /dev/null; then
+        pyright --outputjson $CHANGED_FILES 2>&1 || true
+    elif python -m pyright --version &> /dev/null 2>&1; then
+        python -m pyright --outputjson $CHANGED_FILES 2>&1 || true
+    else
+        echo "=== PYRIGHT NOT AVAILABLE ==="
+    fi
 else
-    echo "=== PYRIGHT NOT AVAILABLE ==="
+    echo "No Python files to check"
 fi
 
 echo "=== DIAGNOSTICS COMPLETE ==="
@@ -64,7 +78,6 @@ class DockerDiagnosticsRunner:
         self,
         instance_id: str,
         patch: str,
-        container_name: Optional[str] = None,
         image_name: Optional[str] = None,
     ) -> DiagnosticResult:
         """Run diagnostics inside a SWE-bench container.
@@ -72,8 +85,7 @@ class DockerDiagnosticsRunner:
         Args:
             instance_id: The SWE-bench instance ID
             patch: The patch to apply and analyze
-            container_name: Existing container name (if reusing)
-            image_name: Docker image to use (if creating new container)
+            image_name: Docker image to use (derived from instance_id if not provided)
 
         Returns:
             DiagnosticResult with parsed diagnostics
@@ -85,7 +97,7 @@ class DockerDiagnosticsRunner:
             return result
 
         # Derive image name from instance_id if not provided
-        if not image_name and not container_name:
+        if not image_name:
             # SWE-bench image naming convention
             repo, issue = instance_id.rsplit("-", 1)
             image_name = f"swebench/{repo.replace('__', '/')}:{instance_id}"
@@ -103,7 +115,7 @@ class DockerDiagnosticsRunner:
                 script_file.write_text(CONTAINER_DIAGNOSTICS_SCRIPT)
                 script_file.chmod(0o755)
 
-                # Run diagnostics in container
+                # Run diagnostics in a new container
                 cmd = [
                     "docker",
                     "run",
@@ -112,13 +124,9 @@ class DockerDiagnosticsRunner:
                     f"{patch_file}:/tmp/patch.diff:ro",
                     "-v",
                     f"{script_file}:/tmp/run_diagnostics.sh:ro",
+                    image_name,
+                    "/tmp/run_diagnostics.sh",
                 ]
-
-                if container_name:
-                    # Use existing container
-                    cmd = ["docker", "exec", container_name, "/tmp/run_diagnostics.sh"]
-                else:
-                    cmd.extend([image_name, "/tmp/run_diagnostics.sh"])
 
                 proc = subprocess.run(
                     cmd,

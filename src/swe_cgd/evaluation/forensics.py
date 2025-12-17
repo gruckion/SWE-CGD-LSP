@@ -162,11 +162,19 @@ class ForensicsCollector:
             timeouts=0,
         )
 
-        # Load results if available
-        results = {}
+        # Load results if available and build status mapping
+        # SWE-bench results.json format: {"resolved": [...], "failed": [...], "error": [...]}
+        status_by_instance: dict[str, str] = {}
         if results_file and results_file.exists():
             with open(results_file) as f:
                 results = json.load(f)
+                # Build instance_id -> status mapping from SWE-bench list format
+                for instance_id in results.get("resolved", []):
+                    status_by_instance[instance_id] = "resolved"
+                for instance_id in results.get("failed", []):
+                    status_by_instance[instance_id] = "failed"
+                for instance_id in results.get("error", []):
+                    status_by_instance[instance_id] = "error"
 
         # Process evaluation logs
         eval_logs_dir = logs_dir / "run_evaluation" / run_id
@@ -178,10 +186,12 @@ class ForensicsCollector:
                 instance_id = instance_dir.name
                 report.total_instances += 1
 
+                # Get status from results mapping
+                status = status_by_instance.get(instance_id, "unknown")
                 forensics = self._analyze_instance_logs(
                     instance_id,
                     instance_dir,
-                    results.get(instance_id, {}),
+                    status,
                 )
                 report.add_instance(forensics)
 
@@ -191,13 +201,18 @@ class ForensicsCollector:
         self,
         instance_id: str,
         instance_dir: Path,
-        results: dict,
+        status_from_results: str,
     ) -> InstanceForensics:
-        """Analyze logs for a single instance."""
+        """Analyze logs for a single instance.
 
+        Args:
+            instance_id: The instance ID
+            instance_dir: Directory containing instance logs
+            status_from_results: Status from SWE-bench results (resolved/failed/error/unknown)
+        """
         forensics = InstanceForensics(
             instance_id=instance_id,
-            status="unknown",
+            status=status_from_results if status_from_results != "unknown" else "unknown",
         )
 
         # Check test output log
@@ -206,24 +221,22 @@ class ForensicsCollector:
             content = test_output.read_text()
             forensics.test_log_excerpt = content[-2000:] if len(content) > 2000 else content
 
-            # Parse test results (basic heuristics)
-            if "PASSED" in content or "OK" in content:
-                forensics.status = "resolved"
-            elif "FAILED" in content or "ERROR" in content:
-                forensics.status = "failed"
-                # Count failures
-                forensics.tests_failed = content.count("FAILED")
-                forensics.tests_passed = content.count("PASSED")
+            # Parse test results (basic heuristics) - only if we don't have explicit status
+            if forensics.status == "unknown":
+                if "PASSED" in content or "OK" in content:
+                    forensics.status = "resolved"
+                elif "FAILED" in content or "ERROR" in content:
+                    forensics.status = "failed"
+
+            # Count test results regardless
+            forensics.tests_failed = content.count("FAILED")
+            forensics.tests_passed = content.count("PASSED")
 
         # Check patch application
         patch_log = instance_dir / "patch_output.txt"
         if patch_log.exists():
             content = patch_log.read_text()
             forensics.patch_applied = "error" not in content.lower()
-
-        # If we have explicit results
-        if "status" in results:
-            forensics.status = results["status"]
 
         return forensics
 

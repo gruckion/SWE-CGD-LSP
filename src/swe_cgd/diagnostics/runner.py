@@ -36,6 +36,18 @@ class DiagnosticIssue:
             "message": self.message,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "DiagnosticIssue":
+        """Create DiagnosticIssue from dictionary."""
+        return cls(
+            file=data.get("file", "unknown"),
+            line=data.get("line", 1),
+            column=data.get("column", 1),
+            severity=data.get("severity", "error"),
+            code=data.get("code", "unknown"),
+            message=data.get("message", ""),
+        )
+
 
 @dataclass
 class DiagnosticResult:
@@ -51,8 +63,13 @@ class DiagnosticResult:
 
     @property
     def has_issues(self) -> bool:
-        """Check if there are any issues."""
-        return bool(self.syntax_errors or self.type_errors or self.apply_error)
+        """Check if there are any issues (including patch apply failures)."""
+        return bool(
+            not self.patch_applied
+            or self.syntax_errors
+            or self.type_errors
+            or self.apply_error
+        )
 
     @property
     def total_errors(self) -> int:
@@ -113,6 +130,23 @@ class DiagnosticResult:
             "type_errors": [e.to_dict() for e in self.type_errors],
             "summary": self.get_summary(),
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DiagnosticResult":
+        """Create DiagnosticResult from dictionary."""
+        return cls(
+            instance_id=data["instance_id"],
+            patch_applied=data.get("patch_applied", False),
+            apply_error=data.get("apply_error"),
+            syntax_errors=[
+                DiagnosticIssue.from_dict(e) for e in data.get("syntax_errors", [])
+            ],
+            type_errors=[
+                DiagnosticIssue.from_dict(e) for e in data.get("type_errors", [])
+            ],
+            pyright_output=data.get("pyright_output"),
+            compileall_output=data.get("compileall_output"),
+        )
 
 
 class DiagnosticsRunner:
@@ -178,8 +212,8 @@ class DiagnosticsRunner:
         except Exception as e:
             return False, str(e)
 
-    def run_compileall(self, repo_dir: Path, files: list[str]) -> list[DiagnosticIssue]:
-        """Run Python's compileall to check for syntax errors."""
+    def run_py_compile(self, repo_dir: Path, files: list[str]) -> list[DiagnosticIssue]:
+        """Run Python's py_compile to check for syntax errors."""
         issues = []
 
         for file_path in files:
@@ -201,10 +235,18 @@ class DiagnosticsRunner:
                 if result.returncode != 0:
                     # Parse syntax error from stderr
                     error_msg = result.stderr.strip()
+                    # Try to extract line number from error message
+                    line_num = 1
+                    if "line " in error_msg.lower():
+                        import re
+                        match = re.search(r"line (\d+)", error_msg, re.IGNORECASE)
+                        if match:
+                            line_num = int(match.group(1))
+
                     issues.append(
                         DiagnosticIssue(
                             file=file_path,
-                            line=1,  # Could parse from error message
+                            line=line_num,
                             column=1,
                             severity="error",
                             code="SyntaxError",
@@ -306,9 +348,9 @@ class DiagnosticsRunner:
         # Get changed files
         changed_files = self.get_changed_files(patch)
 
-        # Run compileall for syntax errors
+        # Run py_compile for syntax errors
         if self.config.diagnostics.use_compileall:
-            result.syntax_errors = self.run_compileall(repo_dir, changed_files)
+            result.syntax_errors = self.run_py_compile(repo_dir, changed_files)
 
         # Run pyright for type errors
         if self.config.diagnostics.use_pyright:
