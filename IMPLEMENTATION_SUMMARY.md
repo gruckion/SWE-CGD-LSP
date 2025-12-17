@@ -8,203 +8,224 @@ The proxy doesn't make the model smarter—it stops it wasting budget on predict
 
 ## Current Implementation Status
 
-The current codebase implements **Experiment 2: Counterfactual One-Shot Cleanup** from the validation approach. This is the minimal test to determine if fixing LSP errors rescues outcomes.
+The codebase implements **Experiments 1 & 2** from the validation approach with full cost tracking and decision gate automation.
 
 ### What's Implemented
 
 | Component | Purpose | Status |
 |-----------|---------|--------|
-| Baseline Generator | Generate patches from issue descriptions | ✅ |
+| Baseline Generator | Generate patches from issue descriptions with cost tracking | ✅ |
+| CostMetrics | Track tokens, time, LLM calls per operation | ✅ |
 | Diagnostics Runner | Run pyright/py_compile on patches | ✅ |
 | Docker Diagnostics | Run diagnostics in SWE-bench containers | ✅ |
-| Cleanup Cleaner | One-shot repair using diagnostic feedback | ✅ |
-| Forensics Collector | Analyze predictiveness of early errors | ✅ |
+| PatchCleaner | Iterative repair loop with token budget | ✅ |
+| Predictive Metrics | P(fail\|error), ceiling, predictiveness ratio | ✅ |
+| Cost Analysis | Cost per solved, cost per instance | ✅ |
+| Decision Gate | Automated go/no-go evaluation | ✅ |
 | Results Comparator | Compare cost + pass rate | ✅ |
-| Pipeline Orchestrator | End-to-end experiment runner | ✅ |
+| Pipeline Orchestrator | End-to-end experiment runner with cost tracking | ✅ |
 
 ### What's NOT Implemented Yet
 
 | Component | Purpose | Status |
 |-----------|---------|--------|
-| Lazy Proxy | Buffer → diagnose → hidden repair loop | 🔜 |
-| Cost Tracking | Tokens, tool calls, wall time per task | 🔜 |
+| Lazy Proxy | Buffer → diagnose → hidden repair loop → return clean | 🔜 |
 | Budget-Constrained Eval | Fixed max tool calls / tokens | 🔜 |
 | Churn Delta Metrics | Extra tool calls after first LSP error | 🔜 |
+| Variance/Tail Analysis | Frequency of token blow-ups | 🔜 |
+
+## Key Data Structures
+
+### CostMetrics
+```python
+@dataclass
+class CostMetrics:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    wall_time_seconds: float = 0.0
+    llm_calls: int = 0
+    failed_calls: int = 0
+```
+
+### Prediction (with cost tracking)
+```python
+@dataclass
+class Prediction:
+    instance_id: str
+    model_name_or_path: str
+    model_patch: str
+    cost_metrics: Optional[CostMetrics] = None
+    repair_iterations: int = 0
+    had_diagnostic_issues: bool = False
+```
+
+### PredictiveMetrics (hypothesis validation)
+```python
+@dataclass
+class PredictiveMetrics:
+    # Computes:
+    # - P(fail | LSP error)
+    # - P(fail | no LSP error)
+    # - Predictiveness ratio
+    # - Ceiling (fraction of failures with errors)
+```
+
+## CLI Commands
+
+```bash
+# Generate baseline predictions with cost tracking
+swe-cgd baseline --max 20
+
+# Run diagnostics and generate cleanup predictions with repair loop
+swe-cgd cleanup preds/baseline.jsonl output/diagnostics.jsonl \
+    --max-iterations 3 \
+    --max-tokens 50000
+
+# Collect forensics with predictive metrics
+swe-cgd forensics <run_id> --diagnostics output/diags.jsonl
+
+# Compare results with cost analysis
+swe-cgd compare baseline.json cleanup.json \
+    --baseline-preds preds/baseline.jsonl \
+    --treatment-preds preds/cleanup.jsonl
+
+# Evaluate decision gate from forensics
+swe-cgd decision-gate output/forensics.json
+
+# Run full pipeline
+swe-cgd run-pipeline --max 20 --max-repair-iterations 3
+# Or one-shot mode:
+swe-cgd run-pipeline --max 20 --one-shot
+```
+
+## Key Metrics
+
+### Headline Metric
+
+**Cost per solved task** = total tokens / #solved instances
+
+### Predictive Metrics (Hypothesis Validation)
+
+| Metric | Description |
+|--------|-------------|
+| P(fail \| LSP error) | Failure rate when diagnostic issues present |
+| P(fail \| no LSP error) | Failure rate when no diagnostic issues |
+| Predictiveness ratio | P(fail\|error) / P(fail\|no error) |
+| Ceiling | Fraction of failures with detectable LSP errors |
+
+### Cost Metrics
+
+| Metric | Description |
+|--------|-------------|
+| cost_per_solved | Tokens per solved instance (headline) |
+| cost_per_failed | Tokens per failed instance |
+| cost_per_instance | Average tokens across all instances |
+| total_llm_calls | Total LLM API calls |
+| total_repair_iterations | Total repair loop iterations |
+
+## Decision Gate
+
+The decision gate automatically evaluates whether the hypothesis is supported:
+
+```
+Criterion 1: Ceiling >= 30%
+  (LSP errors are COMMON in failures)
+
+Criterion 2: Predictiveness ratio >= 1.2x
+  (LSP errors PREDICT failure)
+```
+
+**Outcomes:**
+- **PASS both**: PROCEED with lazy proxy implementation
+- **PASS 1 only**: LIMITED HEADROOM - expand diagnostic coverage
+- **PASS 2 only**: WEAK SIGNAL - investigate why errors don't predict failure
+- **FAIL both**: DO NOT PROCEED - pivot to different approach
+
+## Repair Loop
+
+The PatchCleaner now supports iterative repair:
+
+```python
+cleaner = PatchCleaner(
+    config,
+    max_repair_iterations=3,  # Max iterations per instance
+    max_repair_tokens=50000,  # Token budget for repair
+)
+
+result = cleaner.clean_patch_with_loop(
+    instance,
+    original_patch,
+    diagnostics,
+    run_diagnostics_fn=...,  # Re-run diagnostics after each fix
+)
+```
+
+The loop continues until:
+- No more diagnostic issues, OR
+- Max iterations reached, OR
+- Token budget exhausted
 
 ## Project Structure
 
 ```
 SWE-CGD-LSP/
 ├── src/swe_cgd/
-│   ├── baseline/generator.py      # LLM-based patch generation
+│   ├── baseline/generator.py      # CostMetrics, Prediction, BaselineGenerator
 │   ├── diagnostics/
-│   │   ├── runner.py              # Pyright/py_compile + DiagnosticResult
-│   │   └── docker_runner.py       # Docker-based diagnostics for SWE-bench
-│   ├── cleanup/cleaner.py         # One-shot diagnostic cleanup
+│   │   ├── runner.py              # DiagnosticResult, DiagnosticsRunner
+│   │   └── docker_runner.py       # Docker-based diagnostics
+│   ├── cleanup/cleaner.py         # PatchCleaner with repair loop
 │   ├── evaluation/
-│   │   ├── forensics.py           # Predictiveness analysis
-│   │   └── comparison.py          # Cost + pass rate comparison
-│   ├── pipeline/orchestrator.py   # Full pipeline runner
+│   │   ├── forensics.py           # PredictiveMetrics, CostAnalysis, decision gate
+│   │   └── comparison.py          # Cost-aware comparison
+│   ├── pipeline/orchestrator.py   # Full pipeline with cost tracking
 │   ├── utils/                     # Config + logging
-│   └── cli.py                     # Typer CLI
-├── scripts/
-│   ├── setup_swebench.sh          # Setup script
-│   ├── run_experiment.sh          # Full experiment runner
-│   └── quick_test.py              # Quick local tests
+│   └── cli.py                     # Typer CLI with new commands
 ├── tests/
-│   ├── test_diagnostics.py        # Tests for diagnostics parsing
-│   └── test_cleanup.py            # Tests for cleanup invocation
+│   ├── test_cleanup.py            # Cleanup + cost tests
+│   ├── test_diagnostics.py        # Diagnostics parsing tests
+│   └── test_forensics.py          # Predictive metrics + decision gate tests
 ├── HYPOTHESIS.md                  # Full hypothesis documentation
-├── pyproject.toml                 # Project config
-└── README.md                      # Documentation
+├── pyproject.toml
+└── README.md
 ```
-
-## Key Components
-
-### 1. Baseline Generator (`src/swe_cgd/baseline/generator.py`)
-
-Generates patches from issue descriptions using LiteLLM.
-
-- Handles `max_instances` with yielded count (not dataset index)
-- Outputs SWE-bench compatible JSONL
-
-### 2. Diagnostics Runner (`src/swe_cgd/diagnostics/runner.py`)
-
-Runs static analysis to detect workspace consistency violations:
-
-- `DiagnosticIssue` / `DiagnosticResult` dataclasses with full serialization
-- `has_issues` property includes `patch_applied=False` as an issue
-- `run_py_compile()` for syntax checking
-- `run_pyright()` for type/semantic errors
-
-**What it catches:**
-- Undefined symbols
-- Signature mismatches
-- Type errors
-- Wrong imports
-- Wrong member access
-
-### 3. Docker Diagnostics (`src/swe_cgd/diagnostics/docker_runner.py`)
-
-Runs diagnostics inside SWE-bench Docker containers:
-
-- Uses `git diff --name-only` to get changed files
-- Handles empty file lists gracefully
-- Matches the actual workspace environment
-
-### 4. Cleanup Cleaner (`src/swe_cgd/cleanup/cleaner.py`)
-
-One-shot repair using diagnostic feedback:
-
-- Feeds diagnostics back to LLM
-- Only invokes when `diagnostics.has_issues` is True
-- Includes control experiment (resample without diagnostics)
-
-### 5. Forensics Collector (`src/swe_cgd/evaluation/forensics.py`)
-
-Analyzes predictiveness of early LSP errors:
-
-- Parses SWE-bench `results.json` format
-- Computes P(fail | early LSP error) vs P(fail | no early LSP error)
-- Identifies ceiling (fraction of failures with detectable errors)
-
-### 6. Results Comparator (`src/swe_cgd/evaluation/comparison.py`)
-
-Compares baseline vs cleanup:
-
-- Pass rate comparison
-- Cost metrics (when implemented)
-- Improvement/regression rates
-
-### 7. Pipeline Orchestrator (`src/swe_cgd/pipeline/orchestrator.py`)
-
-Runs the full experiment:
-
-- Uses Docker diagnostics for real workspace parity
-- Parses diagnostics using `DiagnosticResult.from_dict()`
-- Orchestrates baseline → diagnostics → cleanup → evaluation
-
-## CLI Commands
-
-```bash
-swe-cgd baseline --max 20          # Generate baseline predictions
-swe-cgd cleanup <baseline> <diags> # Generate cleanup predictions
-swe-cgd forensics <run_id>         # Collect predictiveness metrics
-swe-cgd compare <base> <treat>     # Compare cost + pass rate
-swe-cgd run-pipeline --max 20      # Run full pipeline
-```
-
-## Key Fixes Applied
-
-1. **Diagnostics properly parsed**: Both CLI and pipeline use `DiagnosticResult.from_dict()` for full parsing
-2. **`has_issues` includes patch failures**: Returns `True` when `patch_applied=False`
-3. **Docker script fixed**: Uses `git diff --name-only` (not `HEAD~1`) for working tree changes
-4. **`max_instances` logic fixed**: Tracks yielded count separately from dataset index
-5. **Forensics results mapping fixed**: Correctly parses SWE-bench's list-based results format
-
-## Validation Experiments
-
-### Experiment 1: Baseline Forensics ✅ (Implemented)
-
-*Is "early LSP error" predictive of failure/cost?*
-
-```bash
-swe-cgd forensics <run_id> --logs-dir logs
-```
-
-Computes:
-- P(fail | early LSP error) vs P(fail | no early LSP error)
-- Churn delta (extra tool calls after first error) — *needs cost tracking*
-- Ceiling (fraction of failures with early persistent errors)
-
-### Experiment 2: One-Shot Cleanup ✅ (Implemented)
-
-*Does fixing LSP errors actually rescue outcomes?*
-
-```bash
-swe-cgd run-pipeline --max 20
-```
-
-- Generates baseline patch
-- Runs diagnostics
-- If errors, one follow-up LLM call to repair
-- Compares pass rates
-
-**Interpretation:**
-- Pass rate barely moves → thesis weakens
-- Pass rate moves materially → real headroom exists
-
-### Experiment 3: Lazy Proxy POC 🔜 (Not Yet Implemented)
-
-*Does preventing broken intermediate states reduce churn?*
-
-Would implement:
-- Buffer model output fully
-- Apply to workspace
-- Run LSP diagnostics
-- Hidden repair loop until clean (or budget exhausted)
-- Only return clean output to outer agent
-
-## Decision Gate
-
-If experiments cannot show:
-
-1. Early LSP Error is **common** in failures, AND
-2. Eliminating it often **rescues the run or reduces churn**
-
-...then the thesis is not strong enough to justify deeper engineering (lazy proxy, token-level CGD, etc.).
 
 ## Next Steps
 
 1. **Run Experiment 1+2**: Execute on 100-200 SWE-bench tasks
-2. **Add Cost Tracking**: Tokens, tool calls, wall time per task
-3. **Evaluate Decision Gate**: Does the data support the hypothesis?
-4. **If yes**: Implement Lazy Proxy POC (Experiment 3)
-5. **If no**: Pivot or abandon
+2. **Evaluate Decision Gate**: Does the data support the hypothesis?
+3. **If PROCEED**: Implement Lazy Proxy POC (Experiment 3)
+4. **If NOT PROCEED**: Pivot or expand diagnostic coverage
 
 ## Running Tests
 
 ```bash
 pip install -e ".[dev]"
 pytest tests/ -v
+```
+
+## Example Output
+
+```
+Decision Gate Evaluation
+==========================
+Predictive Metrics:
+  P(fail | LSP error):    75.0%
+  P(fail | no LSP error): 45.0%
+  Predictiveness ratio:   1.67x
+  Ceiling:                55.0%
+
+Criteria:
+  ✓ PASS Ceiling >= 30%
+         Actual: 0.55, Required: 0.30
+  ✓ PASS Predictiveness ratio >= 1.2x
+         Actual: 1.67, Required: 1.20
+
+Overall Result: GATE PASSED
+
+Recommendation:
+  PROCEED: The data supports the hypothesis.
+  LSP errors are common in failures and predictive of failure.
+  Consider implementing the lazy proxy POC.
 ```
